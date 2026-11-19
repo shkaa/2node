@@ -8,7 +8,7 @@
 #   ?ip=АДРЕС_ЭТОГО_СЕРВЕРА
 set -euo pipefail
 
-ORIGIN="${ORIGIN:-89.127.213.243}"
+ORIGIN="${ORIGIN:-}"
 RELAY_NAME="${RELAY_NAME:-kakamba.work.gd}"
 SITE_DOMAIN="${SITE_DOMAIN:-gosuslugi.win}"
 NAIVE_USER=""
@@ -31,15 +31,49 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+valid_ipv4() {
+  local ip="$1" o
+  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do
+    [ "$o" -le 255 ] || return 1
+  done
+}
+
+urlencode() {
+  local LC_ALL=C
+  local s="$1" i c hex out=""
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      [a-zA-Z0-9._~-]) out+="$c" ;;
+      *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 if [ -f /etc/caddy/Caddyfile ] && grep -q "forward_proxy" /etc/caddy/Caddyfile; then
   echo "Здесь уже основной naive-сервер. Этот скрипт ставится только на новый VPS."
   exit 1
 fi
 
+if [ -f /etc/nginx/nginx.conf ] && grep -q "ssl_preread" /etc/nginx/nginx.conf; then
+  if [ ! -t 0 ]; then
+    echo "Посредник уже настроен. Запусти скрипт из терминала и подтверди перезапись."
+    exit 1
+  fi
+  read -r -p "Посредник уже стоит. Перезаписать конфиг и перезапустить? [y/N]: " _overwrite
+  [[ "$_overwrite" =~ ^[Yy]$ ]] || { echo "Ничего не менял."; exit 1; }
+  unset _overwrite
+fi
+
 if [ -t 0 ]; then
   if [ "$ASK_ORIGIN" = 1 ]; then
-    read -r -p "IP основного сервера [$ORIGIN]: " _v
-    ORIGIN="${_v:-$ORIGIN}"
+    while true; do
+      read -r -p "IP основного сервера: " ORIGIN
+      valid_ipv4 "$ORIGIN" && break
+      echo "Нужен IPv4 нового основного. Старый адрес сам не подставляется."
+    done
   fi
   if [ "$ASK_NAME" = 1 ]; then
     read -r -p "Имя в ссылке, его сертификат на основном [$RELAY_NAME]: " _v
@@ -57,9 +91,14 @@ if [ -t 0 ]; then
   unset _v
 fi
 
+if ! valid_ipv4 "$ORIGIN"; then
+  echo "Задай IP основного: ORIGIN=1.2.3.4 bash install.sh"
+  exit 1
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y curl ca-certificates debian-keyring debian-archive-keyring apt-transport-https gnupg nginx libnginx-mod-stream
+apt-get install -y curl ca-certificates debian-keyring debian-archive-keyring apt-transport-https gnupg nginx libnginx-mod-stream ufw
 
 systemctl stop nginx >/dev/null 2>&1 || true
 
@@ -172,6 +211,11 @@ caddy validate --config /etc/caddy/Caddyfile
 systemctl enable caddy
 systemctl restart caddy
 
+LISTEN6=""
+if [ -f /proc/net/if_inet6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" = "0" ]; then
+  LISTEN6="    listen [::]:443;"
+fi
+
 cat > /etc/nginx/nginx.conf << EOF
 load_module /usr/lib/nginx/modules/ngx_stream_module.so;
 user www-data;
@@ -186,7 +230,7 @@ stream {
   }
   server {
     listen 443;
-    listen [::]:443;
+${LISTEN6}
     proxy_pass \$upstream;
     ssl_preread on;
     proxy_connect_timeout 5s;
@@ -199,12 +243,18 @@ nginx -t
 systemctl enable nginx
 systemctl restart nginx
 
-if command -v ufw >/dev/null 2>&1; then
-  ufw allow 22/tcp >/dev/null || true
-  ufw allow 80/tcp >/dev/null || true
-  ufw allow 443/tcp >/dev/null || true
-  ufw --force enable >/dev/null || true
+SSH_PORT=22
+if [ -n "${SSH_CONNECTION:-}" ]; then
+  SSH_PORT="${SSH_CONNECTION##* }"
 fi
+[[ "$SSH_PORT" =~ ^[0-9]+$ ]] || SSH_PORT=22
+ufw allow 22/tcp >/dev/null || true
+ufw allow "${SSH_PORT}/tcp" >/dev/null || true
+ufw allow 80/tcp >/dev/null || true
+ufw allow 443/tcp >/dev/null || true
+ufw allow 8080/tcp >/dev/null || true
+ufw deny 8443/tcp >/dev/null || true
+ufw --force enable >/dev/null || true
 
 IP="$(curl -4 -fsS --max-time 8 https://api.ipify.org || true)"
 echo
@@ -216,10 +266,22 @@ if [ -n "$IP" ]; then
     echo "Этот адрес совпал с основным сервером. Клиентскую ссылку не меняй."
   elif [ -n "$NAIVE_USER" ] && [ -n "$NAIVE_PASS" ]; then
     echo "Ссылка для клиента. На диск она не записана:"
-    echo "naive+https://${NAIVE_USER}:${NAIVE_PASS}@${RELAY_NAME}:443?ip=${IP}"
+    echo "naive+https://$(urlencode "$NAIVE_USER"):$(urlencode "$NAIVE_PASS")@${RELAY_NAME}:443?ip=${IP}"
   else
     echo "В ссылке клиента замени ip на: ?ip=${IP}"
   fi
 else
   echo "Внешний IP не определился. Подставь адрес этого VPS в ?ip="
+fi
+
+if timeout 5 bash -c "echo >/dev/tcp/${ORIGIN}/443"; then
+  echo "До основного ${ORIGIN}:443 соединение есть."
+else
+  echo "До основного ${ORIGIN}:443 не достучаться. Проброс не заработает, пока основной не слушает 443."
+fi
+
+if curl -fsS --max-time 20 --resolve "${RELAY_NAME}:443:127.0.0.1" "https://${RELAY_NAME}/" -o /dev/null; then
+  echo "Проброс ${RELAY_NAME} через этот VPS отвечает, сертификат основного сошёлся."
+else
+  echo "Проброс поднят, но TLS ${RELAY_NAME} через него не сошёлся. Чаще всего на основном ещё нет сертификата."
 fi
